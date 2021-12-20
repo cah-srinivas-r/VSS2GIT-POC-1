@@ -1,0 +1,406 @@
+;
+;=============================================================================
+; Change History (reverse chronological order)
+;
+;Date		Project			Who		Mark		WhatChange
+;11/10/2021	ePrescribe		KSB				Initial Version.
+;=============================================================================
+; Description : Functionality of this program shows how the customer search 
+; is performed in RGH for the ePrescribe (Parachute Health) system.
+; This webservice is called from the "traffic cop" functionality of ICON to 
+; determine  if the customer exist or does not exist in RGH. Traffic cop will 
+; call this webservice (ePrescribe_CustomerSearch) through the parameters and 
+; returns the RGH account number to traffic cop (if one exist)
+;=============================================================================
+.subroutine ePrescribe_CustomerSearch
+	io_ePresCustomerSrch	,a	;Inbound/outbound CustomerSearch structure
+
+.include 'mfd:gwindow.mfd'
+.include 'wnd:windows.def'
+.include 'mfd:eprescribe_global.mfd'		
+.include 'mfd:common.mfd'
+	
+.include 'EpresCustomerSrch'  repository 'rpsloc',record='iCustomerSearch'
+
+.include 'epCustomer' repository 'rpsloc',record='recEPCustomer'
+.include 'epContact' repository 'rpsloc',record='recEPContact'
+.include 'econtactkey2'   repository 'rpsloc', record='Contactkey'
+
+external function
+        collapse	,a
+
+.align
+record a_work
+	strErrorText		,a50
+	recv_full_name		,a50
+	recv_rghaccountno	,a11
+	recv_iconaccountno	,a13
+	cntcustno		,a11
+
+.align
+record d_work
+	flgMatchFound		,d1
+	cntMatchFound		,d1
+	datDOB			,d8
+	decPhone		,d10
+	decBdateReadCount	,d9
+	custphnnum		,d10
+;	ch$errlog               ,d4     ;error log
+
+;.align
+record i_work
+	intErrorCode		,i4
+ 
+
+.ifndef TRUE            	
+.define TRUE				,1  
+.endc                   	
+.ifndef FALSE
+.define FALSE				,0
+.endc                   	
+.ifndef EPCOMPANY       	
+.define EPCOMPANY			,1  
+.endc   
+
+.define D_ERRORTEXT_SRCSYSTM	,"Source system id is not passed "
+.define D_ERRORTEXT_UNIQUEID    ,"Unique ID not passed, Please check "
+.define D_ERRORTEXT_DETAILS	,"Required parameters not passed, check Fname, Lname and DOB "
+;.define D_RETRN_MSG_UNIQUE	,"Unique ID matched "
+;.define D_RETRN_MSG_NAME	,"Name and DOB matched "	
+;.define D_RETRN_MSG_PHONE	,"Phone number matched "
+;.define D_RETRN_MSG_NOMATCH     ,"No match found in RGH "
+	
+.proc
+	onerror ($err_catch) errtrap
+	
+	;validate recieved source system and unique ID are passed,
+	call initialize
+	call validateMandatoryFields
+	call SearchByNumber
+	call PopulateOutPut
+	
+;************************************************************************************************************
+;	Initialize all the working variables and assign channels	
+;************************************************************************************************************	
+initialize,
+	
+	;initialize work values
+;	clear o_strErrorText 
+	clear recv_rghaccountno
+	clear recv_iconaccountno
+	clear iCustomerSearch
+	clear a_work, d_work
+	clear ^i(i_work)
+	
+	xcall getcm(common)
+	
+	; Populate channels in the pseudo object structures 
+	recEPCustomer.epchannels.ch$cusma3 = cs3chn
+	recEPCustomer.epchannels.ch$cusmas = cuschn
+	recEPContact.epchannels.ch$cntphn = ePrescribe_channels.ch$cntphn
+	
+;	ch$errlog = %syn_freechn(200,255)
+;	open (ch$errlog,'O:S','SPL:ePrescribe_CustomerSearch' + %datetime + '.txt')
+	
+initialize_Exit,	
+        return
+
+;************************************************************************************************************
+;	Validate all the incoming fields from Traffic Cop	
+;************************************************************************************************************	
+validateMandatoryFields,
+	
+    	;set local data to passed in data
+	iCustomerSearch = io_ePresCustomerSrch 
+	
+	upcase iCustomerSearch
+	
+	;validate the incoming source system	    
+	if (iCustomerSearch.str_epres_source_system .nes. 'PHS') 
+	  begin
+	    iCustomerSearch.str_epres_retrn_msg = %atrim(D_ERRORTEXT_SRCSYSTM)
+;	    writes (ch$errlog,'Error: ' + %atrim(D_ERRORTEXT_SRCSYSTM))
+	    io_ePresCustomerSrch = iCustomerSearch
+	    call CloseExit
+	  end  
+	    
+	;validate the incoming Unique ID
+	if (.not. iCustomerSearch.str_epres_uniqueid) 
+	  begin
+	    iCustomerSearch.str_epres_retrn_msg = %atrim(D_ERRORTEXT_UNIQUEID)
+;	    writes (ch$errlog,'Error: ' + %atrim(D_ERRORTEXT_UNIQUEID))	    
+	    io_ePresCustomerSrch = iCustomerSearch
+	    call CloseExit
+	  end
+      
+        ;Remove specail characters if any in the incoming fields
+	xcall remove_special_characters (iCustomerSearch.str_epres_uniqueid)
+	xcall remove_special_characters (iCustomerSearch.str_epres_first_name)
+	xcall remove_special_characters (iCustomerSearch.str_epres_last_name)
+	xcall remove_special_characters (iCustomerSearch.str_epres_birth_date)
+	xcall remove_special_characters (iCustomerSearch.str_epres_bill_phoneno)
+	iCustomerSearch.str_epres_bill_phoneno = %collapse(iCustomerSearch.str_epres_bill_phoneno)
+	xcall remove_special_characters (iCustomerSearch.str_epres_deli_phoneno)
+	iCustomerSearch.str_epres_deli_phoneno = %collapse(iCustomerSearch.str_epres_deli_phoneno)
+
+       
+validateMandatoryFields_Exit,      
+	return	    	    
+;************************************************************************************************************
+;	Main process starts here - Search CUSMA3 file using Unique ID passed from Traffic Cop
+;************************************************************************************************************	
+SearchByNumber,
+
+	; Search CUSMA3 file by incoming unique id
+	intErrorCode = %f_find_cusma3(EPCOMPANY, recEPCustomer, %atrim(iCustomerSearch.str_epres_uniqueid),3,Q_NO_TLOCK) 
+	
+	;if no Unique ID match found in CUSMA3, then search CUSMAS using FName and LName	
+	if ((intErrorCode .eq. $ERR_EOF) .or. (intErrorCode .eq. $ERR_KEYNOT)) 
+	  begin
+	    call SearchByName
+	    return
+	  end
+	
+	if (.not. intErrorCode)
+	  begin
+	    intErrorCode = %f_reads_cusma3(EPCOMPANY, recEPCustomer,Q_NO_TLOCK)	    
+
+	      if (intErrorCode .eq. $ERR_EOF)  
+	        return	       
+
+	      if (intErrorCode .eq. 0) 
+	        begin
+	          if (recEPCustomer.epdata.ecusma3.phcusno  .nes. iCustomerSearch.str_epres_uniqueid) then 
+	            begin
+		      return
+	            end
+	          else
+		    begin
+  	              recv_rghaccountno = recEPCustomer.epdata.ecusma3.c3numb
+;		      iCustomerSearch.str_epres_retrn_msg = %atrim(D_RETRN_MSG_UNIQUE)   ; retrun message
+		      call MatchIcon
+		      return
+		    end
+	         end
+	  end
+	  
+SearchByNumber_Exit,	     
+        return
+;************************************************************************************************************
+; 	Skip processing the CUSMA3 account number if its an ICON Account
+;************************************************************************************************************    
+MatchIcon,
+   
+	; Search CUSMAS file for secondary match 
+	clear intErrorCode
+	
+	intErrorCode = %f_read_cusmas(EPCOMPANY, recEPCustomer,recv_rghaccountno,,Q_NO_TLOCK)
+
+	if ((intErrorCode .eq. $ERR_EOF) .or. (intErrorCode .eq. $ERR_KEYNOT))
+	  return
+
+	if (intErrorCode .eq. 0) 
+	  begin
+	    if (recv_rghaccountno .eqs. recEPCustomer.epdata.ecusmas.cusno) begin
+	      if (recEPCustomer.epdata.ecusmas.epstacno)   
+		 recv_iconaccountno = recEPCustomer.epdata.ecusmas.epstacno
+	    end
+	  end
+;	    end
+	    
+MatchIcon_Exit,	  
+	return
+;************************************************************************************************************
+; 	Search CUSMAS file, using the Full Name and Date of Birth passed from Traffic Cop 
+;************************************************************************************************************
+SearchByName,
+    
+	d_work.datDOB = iCustomerSearch.str_epres_birth_date
+	
+    	;validate the incoming FName, LName and DOB
+	if ((.not. iCustomerSearch.str_epres_first_name) .or. (.not. iCustomerSearch.str_epres_last_name) .or. (.not. iCustomerSearch.str_epres_birth_date)) 
+	  begin
+	    iCustomerSearch.str_epres_retrn_msg = %atrim(D_ERRORTEXT_DETAILS)
+;	    writes (ch$errlog,'Error: ' + %atrim(D_ERRORTEXT_DETAILS))
+	    io_ePresCustomerSrch = iCustomerSearch
+	    call CloseExit
+	  end
+      
+	call MatchName
+	 
+    	if (decBdateReadCount .eq. 1) 
+	    return
+	  	  
+	if (decBdateReadCount .gt. 1)
+	  call SearchByPhone
+	
+SearchByName_Exit,
+	return
+;************************************************************************************************************
+; 	Match the Full Name and Date of Birth passed from Traffic Cop with the CUSMAS file
+;************************************************************************************************************    
+MatchName,
+   
+	; Search CUSMAS file by incoming name 
+	clear intErrorCode
+	clear decBdateReadCount
+	a_work.recv_full_name = %atrim(iCustomerSearch.str_epres_last_name) + ', ' + %atrim(iCustomerSearch.str_epres_first_name)
+	
+	intErrorCode = %f_find_cusmas(EPCOMPANY, recEPCustomer, %atrim(a_work.recv_full_name),1,Q_NO_TLOCK) 
+	
+	if ((intErrorCode .eq. $ERR_EOF) .or. (intErrorCode .eq. $ERR_KEYNOT)) 
+	  return
+	  
+	if (.not. intErrorCode)
+	  repeat    	      
+	    begin
+	      intErrorCode = %f_reads_cusmas(EPCOMPANY, recEPCustomer,Q_NO_TLOCK) 	      
+
+	      if (intErrorCode .eq. $ERR_EOF)
+		exitloop
+
+	      if(intErrorCode .eq. 0) 
+		begin
+		  if (%atrim(a_work.recv_full_name(1,25)) .nes. %atrim(recEPCustomer.epdata.ecusmas.name)) then
+		    begin
+		      exitloop 
+		    end  
+		  else
+		    begin
+;		      if (.not. recEPCustomer.epdata.ecusmas.epstacno) 
+;		      if (recEPCustomer.epdata.ecusmas.epstacno)
+;		        recv_iconaccountno = recEPCustomer.epdata.ecusmas.epstacno
+		    
+		      if (d_work.datDOB .eq. recEPCustomer.epdata.ecusmas.brthdt) then 
+		        begin
+			  if (recEPCustomer.epdata.ecusmas.epstacno)
+			    recv_iconaccountno = recEPCustomer.epdata.ecusmas.epstacno
+			  incr decBdateReadCount		;More than one record found
+		          recv_rghaccountno = recEPCustomer.epdata.ecusmas.cusno 
+		        end
+		      else
+		        nextloop
+		      end
+	        end
+	    end
+	
+	    
+MatchName_Exit,	  
+	return
+;************************************************************************************************************
+;	Search CNTPHN file using the Billing and Delivery phone number provided by Traffic Cop	  
+;************************************************************************************************************	  
+SearchByPhone,	  
+	  
+;  	Seacrh CNTPHN file using Customer Billing Phone Number
+	clear recv_rghaccountno
+	clear d_work.custphnnum	 
+	clear d_work.flgMatchFound
+	clear contactkey
+	  
+	d_work.custphnnum = iCustomerSearch.str_epres_bill_phoneno
+	contactkey.decphonenumber = d_work.custphnnum
+	if (iCustomerSearch.str_epres_bill_phoneno)
+	  call MatchPhone
+
+;  	Seacrh CNTPHN file using Customer Delivery Phone Number	
+	if ((d_work.flgMatchFound) .or. (.not. iCustomerSearch.str_epres_deli_phoneno)) then ; Match already found
+	  return
+	else
+	  begin
+	    clear contactkey
+	    clear d_work.custphnnum
+	    d_work.custphnnum = iCustomerSearch.str_epres_deli_phoneno
+	    contactkey.decphonenumber = d_work.custphnnum
+	    call MatchPhone   
+	  end
+	  
+SearchByPhone_Exit,	    
+	return
+;************************************************************************************************************
+;	Match the Billing and Delivery phone number provided by Traffic Cop with the CNTPHN DecPhone number	  
+;************************************************************************************************************	  
+MatchPhone ,
+	  	  
+	; Search CNTPHN file by incoming phone number	  
+	intErrorCode = %f_FindContact(recEPContact, contactkey(1,10),Q_ALT2,Q_NO_TLOCK)   
+	
+	if ((intErrorCode .ne. $ERR_EOF) .and. (intErrorCode .ne. $ERR_KEYNOT))
+	  repeat
+	    begin
+              intErrorCode = %f_readsContact(recEPContact,Q_NO_TLOCK)     
+	      using intErrorCode select
+		($ERR_EOF, $ERR_KEYNOT),
+		  exitloop
+		(0),
+		  begin
+		    if (contactkey.decphonenumber .eq. recEPContact.epdata.econtact.decPhoneNumber) then
+		      begin
+			cntcustno = recEPContact.epdata.econtact.strcustomernumber
+			call ValidateName
+			  if (cntMatchFound) 
+			    begin
+			      recv_rghaccountno = recEPContact.epdata.econtact.strCustomerNumber
+			      recv_iconaccountno = recEPCustomer.epdata.ecusmas.epstacno
+			      d_work.flgMatchFound = TRUE
+			      exitloop
+			    end
+	              end
+		    else
+		      d_work.flgMatchFound = FALSE
+		  end		  
+	      endusing
+	    end
+	 	  
+MatchPhone_Exit,	  
+	return
+;************************************************************************************************************
+; 	Validate the Account number with the CUSMAS account
+;************************************************************************************************************
+ValidateName,
+	
+	cntMatchFound = FALSE
+	clear intErrorCode
+	
+	intErrorCode = %f_read_cusmas(EPCOMPANY, recEPCustomer,cntcustno,,Q_NO_TLOCK) 
+	
+	if ((intErrorCode .eq. $ERR_EOF) .or. (intErrorCode .eq. $ERR_KEYNOT))
+	  return
+	
+	if (intErrorCode .eq. 0) 
+	  begin
+	   if ((d_work.datDOB .eq. recEPCustomer.epdata.ecusmas.brthdt) .and. (%atrim(a_work.recv_full_name(1,25)) .eqs. %atrim(recEPCustomer.epdata.ecusmas.name))) 
+	      cntMatchFound = TRUE
+	  end
+	
+ValidateName_Exit,
+        return	
+;************************************************************************************************************
+; 	Populate the outbound structure
+;************************************************************************************************************
+PopulateOutPut,
+	
+	if(recv_rghaccountno) then 
+	  begin
+	   iCustomerSearch.str_epres_rghaccountno = recv_rghaccountno
+	   iCustomerSearch.str_epres_iconaccountno = recv_iconaccountno
+	  end
+	else
+	  clear iCustomerSearch.str_epres_rghaccountno	  
+	
+	io_ePresCustomerSrch = iCustomerSearch
+		
+CloseExit,	
+;	close ch$errlog
+	intErrorCode = %UnlockAllChannels
+
+	xreturn
+	
+PopulateOutPut_Exit,
+        return
+;************************************************************************************************************
+; 	Trap all th errors	
+;************************************************************************************************************	
+errtrap,	
+        xcall errtrap
+.end		  
